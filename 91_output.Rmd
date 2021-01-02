@@ -1,0 +1,736 @@
+---
+title: "Bridge Analysis"
+author: "DX Analytics https://dxan.co.uk"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: 
+  html_document:
+    theme: journal
+    highlight: monochrome
+    toc: true
+    number_sections: true
+    code_folding: none
+    toc_depth: 3
+    toc_float:
+      collapsed: true
+      smooth_scroll: false
+---
+
+<script>
+   $(document).ready(function() {
+     $head = $('#header');
+     $head.prepend('<img src=\"logowhite_verysmall.png\" style=\"float: right;\"/>')
+   });
+</script>
+
+```{r setup, include=FALSE}
+library(ggplot2)
+# set up a new base-theme for all plots 
+theme_bw2<-theme_bw()+
+  theme(# axis labels
+             axis.title = element_text(size = 20),
+             # tick labels
+             axis.text = element_text(size = 20),
+             # title 
+             title = element_text(size = 20),
+             legend.text=element_text(size=20)
+             )
+theme_set(theme_bw2)
+
+knitr::opts_chunk$set(echo=FALSE, warning=FALSE, message=FALSE, fig.width=15, fig.height=9)
+```
+
+<br><br>
+
+> Use case of bridge data analysis: Part I Interactive Data Visualisation
+
+# Data overview
+***
+Data are in a nested format: 120 recorded items per bridge per state, repeated annually in 2010 - 2018. 
+
+  * **`r length(unique(tmp$STRUCTURE_NUMBER_008))` ** structures 
+  * **`r length(unique(tmp$STATE_CODE_001))` ** US states 
+  * **`r nrow(tmp)` ** structure-year records processed
+  
+## Bridge map  
+
+```{r}
+library(leaflet)
+library(geojsonio)
+library(dplyr)
+library(sjlabelled)
+
+# load basic US map data
+states <- geojsonio::geojson_read("https://raw.githubusercontent.com/PublicaMundi/MappingAPI/master/data/geojson/us-states.json", what = "sp")
+# class(states)
+# names(states)
+
+# name = state name, density = population density, replace with bridge info.
+# For continuous (cat.) variables: within each state is summed (med.) across all bridges for each year and then look at median across years.
+# general condition: poor
+# scour condition: % critical
+
+a<-tmp %>% group_by(STATE_CODE_001) %>%
+  mutate(n_brd=n_distinct(STRUCTURE_NUMBER_008,na.rm=T)) %>%
+           ungroup() %>%
+           group_by(STATE_CODE_001,Year) %>% 
+           mutate(sum_cost=as.numeric(sum(TOTAL_IMP_COST_096,na.rm=T)),
+                  sum_cond=as.numeric(median(as.numeric(GEN_COND.alt),na.rm=T)),
+                  sum_scr=as.numeric(median(as.numeric(SCOUR_CRITICAL_113.alt),na.rm=T)),
+                  sum_ADT=as.numeric(sum(ADT_029,na.rm=T)),
+                  sum_tkADT=as.numeric(sum(ADT_029*PERCENT_ADT_TRUCK_109/100,na.rm=T)),
+                  sum_cond_bad=as.numeric(sum(as.numeric(GEN_COND.alt)==1,na.rm=T)/n()),
+                  sum_scr_bad=as.numeric(sum(as.numeric(SCOUR_CRITICAL_113.alt)==1,na.rm=T)/n())) %>%
+           slice(1) %>%
+           ungroup() %>%
+           group_by(STATE_CODE_001) %>%
+  # set labels for categorical data
+           mutate(med_cost=median(sum_cost,na.rm=T)/10^6, # unit = $B
+                  med_cond_bad=median(sum_cond_bad,na.rm=T)*100,
+                  med_scr_bad=median(sum_scr_bad,na.rm=T)*100,
+                  med_ADT=median(sum_ADT,na.rm=T)/10^6, # unit = M
+                  med_tkADT=median(sum_tkADT,na.rm=T)/10^6, # unit = M
+                  name=as_character(STATE_CODE_001)) %>%
+           slice(1) %>% 
+  ungroup()
+
+
+# merge with the map data
+states@data<-states@data %>%
+  left_join(a %>% select(name,n_brd,med_cost,med_cond_bad,med_scr_bad,
+                         med_ADT,med_tkADT),
+            by="name")
+
+# Prepare the text for tooltips - this bit is not changing by layers
+mytext <- paste(
+    "<strong>" , states@data$name,"</strong><br/>", 
+    "Number of bridges: ", states@data$n_brd, "<br/>", 
+    "Median total cost ($B): ", round(states@data$med_cost,2),"<br/>" ,
+    "Median % bridges in poor general condition: ", round(states@data$med_cond_bad,1), "<br/>",
+    "Median % bridges in closed/critical scour condition: ", round(states@data$med_scr_bad,1), "<br/>",
+    "Median ADT (M): ", round(states@data$med_ADT,1), "<br/>",
+    "Median truck ADT (M): ",round(states@data$med_tkADT,1), "<br/>",
+    sep="") %>%
+  lapply(htmltools::HTML)
+
+# prepare the plots  
+library(RColorBrewer)
+
+# create a function for multiple layers (define what layers you need)
+names(states@data)[-c(1:3)]<-c("Number of bridges","Total cost_Bn","pct poor general condition","pct critical scour condition","ADT_Mn","Truck ADT_Mn")
+group <- c(names(states@data[,-c(1:3)]))
+
+fill <- vector("list", length(group))
+# create color pallette by group
+for (i in 1:length(group)){
+  fill[[i]] = colorBin(palette="YlOrBr", domain=states@data[[group[i]]], 
+                       na.color="transparent", 
+                       bins=sapply(seq(0,1,0.2),function(x){
+                         as.numeric(quantile(as.numeric(states@data[[group[i]]]),x,na.rm=T))
+                       }))
+}
+
+# Final Map
+
+rawmap<-leaflet(states) %>% 
+    # limit to US states only
+    setView(-96, 37.8, 4) %>%
+    addProviderTiles("MapBox", options = providerTileOptions(
+    id = "mapbox.light",
+    accessToken = Sys.getenv('MAPBOX_ACCESS_TOKEN'))) 
+
+
+LeafletLayer <- function(map, fillColor, group){
+  for (i in 1:length(group)){
+  map <-map %>%
+    addPolygons(
+      fillColor = fill[[i]](states@data[[group[i]]]),
+      weight = 2,
+      opacity = 1,
+      color = "white",
+      dashArray = "3",
+      fillOpacity = 0.9,
+      stroke=T,
+      group = group[i],
+      
+      # add highlights for mouse-over areas
+
+      highlight = highlightOptions(
+        weight = 5,
+        color = "#666",
+        dashArray = "",
+        fillOpacity = 0.7,
+        bringToFront = TRUE),
+      label = mytext,
+      labelOptions = labelOptions(
+        style = list("font-weight" = "normal", padding = "3px 8px"),
+          textsize = "13px",
+          direction = "auto")) %>%
+     addLegend(pal = fill[[i]], values = states@data[[group[i]]], opacity = 0.9, title = group[i],
+    position = "bottomright")
+  }
+  map <- addLayersControl(map=map, baseGroups = group,position="bottomleft",
+                          options = layersControlOptions(collapsed = FALSE)) %>%
+    # make legend list interactive to user input 
+    htmlwidgets::onRender("
+    function(el, x) {
+      var updateLegend = function () {
+          var selectedGroup = document.querySelectorAll('input:checked')[0].nextSibling.innerText.substr(1);
+
+          document.querySelectorAll('.legend').forEach(a => a.hidden=true);
+          document.querySelectorAll('.legend').forEach(l => {
+            if (l.children[0].children[0].innerText == selectedGroup) l.hidden=false;
+          });
+      };
+      updateLegend();
+      this.on('baselayerchange', e => updateLegend());
+    }")
+}
+
+map <- LeafletLayer(map=rawmap, fillColor=fill, group=group)
+map
+
+```
+  
+## Number of structures
+
+```{r}
+library(dplyr)
+library(scales)
+library(ggplot2)
+a<-tmp %>% group_by(STATE_CODE_001) %>%
+  mutate(cnt=n_distinct(STRUCTURE_NUMBER_008)) %>%
+  slice(1) %>%
+  select(STATE_CODE_001,cnt) %>%
+  ungroup() %>%
+  arrange(desc(cnt))
+
+ggplot(na.omit(a), aes(x = factor(reorder(STATE_CODE_001,-cnt)),y = cnt)) + 
+  geom_bar(stat = "identity") +
+  scale_y_continuous(breaks=pretty_breaks())+
+  labs(x = "State\n", y = "Number of structures\n") +
+  theme(axis.text.x = element_text(angle=90,vjust=0))
+
+```
+
+## The top 10 states with the most structures
+
+```{r}
+tmp %>% group_by(STATE_CODE_001) %>%
+  mutate(cnt=n_distinct(STRUCTURE_NUMBER_008)) %>%
+  slice(1) %>%
+  select(STATE_CODE_001,cnt) %>%
+  ungroup() %>%
+  arrange(desc(cnt)) %>%
+  mutate(pct=paste0(round(cnt/sum(cnt,na.rm=T),2)*100, "%")) %>%
+  slice(1:10)
+```
+
+## Number of structures with repeated measurements 
+
+* Number of bridges with data in both **2010** and **2018**
+
+```{r}
+a<-tmp %>% filter(Year %in% c(2010,2018)) %>%
+  group_by(STRUCTURE_NUMBER_008) %>%
+  mutate(cnt=n_distinct(Year)) %>%
+  ungroup() %>%
+  select(STRUCTURE_NUMBER_008,cnt) %>%
+  filter(cnt==2)
+
+paste0("Count=",length(unique(a$STRUCTURE_NUMBER_008)), " (",round(length(unique(a$STRUCTURE_NUMBER_008))/length(unique(tmp$STRUCTURE_NUMBER_008))*100,0),"%)")
+
+```
+
+* More details
+
+```{r}
+a<-tmp%>% group_by(STRUCTURE_NUMBER_008) %>%
+  mutate(rep_years=n_distinct(Year)) %>%
+  slice(1) %>%
+  ungroup() %>%
+  group_by(rep_years) %>%
+  mutate(cnt=n_distinct(STRUCTURE_NUMBER_008)) %>%
+  slice(1) %>%
+  select(rep_years,cnt) %>%
+  ungroup() %>%
+  arrange(desc(cnt))
+
+ggplot(na.omit(a), aes(x = factor(reorder(rep_years,-cnt)),y = cnt/sum(cnt)*100)) + 
+  geom_bar(stat = "identity") +
+  scale_y_continuous(breaks=pretty_breaks())+
+  labs(x = "Repeated years\n", y = "% structures\n") +
+  geom_text(aes(label=round(cnt/sum(cnt)*100,0)))+
+  theme(axis.text.x = element_text(angle=90,vjust=0))
+  
+```
+
+# Outcomes
+***
+## Cost {.tabset .tabset-pills .tabset-fade}
+
+  * Dropdown menu to select **Bridge/Roadway/Total** cost
+  * Sum across all bridges within each state for each year
+  * One data point = one state-year record
+
+### All states {.unlisted .unnumbered}
+
+```{r}
+library(stringr)
+library(bsselectR)
+state_plots <- paste0(list.files("outputs/cost", full.names = TRUE))
+names(state_plots) <- str_replace_all(state_plots, 
+                                      c("\\.png" = "", 
+                                        "outputs/cost/" = ""))
+
+bsselect(state_plots, type = "img", selected = "BRIDGE_IMP_COST_094", 
+         live_search = TRUE, show_tick = TRUE, width=15, height=20)
+```
+
+### Select states: highly variable annual cost {.unlisted .unnumbered}
+
+  * List of such states is selected by the year-by-year cost variation. 
+  * Variation = inter-quartile-range (IQR) of natural cost scale (summed over all bridges) across years.
+  * Cost trajectory is plotted using a log10-scale of the **total** cost for the select states. 
+  * Solid triangle = median across these 10 selected states.
+  
+```{r}
+library(stringr)
+library(bsselectR)
+state_plots <- paste0(list.files("outputs/cost_slt", full.names = TRUE))
+names(state_plots) <- str_replace_all(state_plots, 
+                                      c("\\.png" = "", 
+                                        "outputs/cost_slt/" = ""))
+
+bsselect(state_plots, type = "img", selected = "BRIDGE_IMP_COST_094.slt", 
+         live_search = TRUE, show_tick = TRUE, width=15, height=20)
+```
+
+### All states: by general condition {.unlisted .unnumbered}
+
+  * General condition computed as the minimum of deck, superstructure, substructure, culverts condition (items 58, 59, 60, 62).
+  * Grouped into Poor (<=4), Fair (5-6), Good (>=7)
+  * Cost trajectory is plotted using a log10-scale of the **median** cost of all structures across all states in each condition bucket.
+  * Solid triangle = median across all conditions.
+  
+```{r}
+library(stringr)
+library(bsselectR)
+state_plots <- paste0(list.files("outputs/cost2", full.names = TRUE))
+names(state_plots) <- str_replace_all(state_plots, 
+                                      c("\\.png" = "", 
+                                        "outputs/cost2/" = ""))
+
+bsselect(state_plots, type = "img", selected = "BRIDGE_IMP_COST_094.cond", 
+         live_search = TRUE, show_tick = TRUE, width=15, height=20)
+```
+
+### All states: by scour condition {.unlisted .unnumbered}
+
+  * Grouped code: 0-3 (Closed/critical), 4-7,U (Stable), 8-9,T (Good). 
+  * NA = not recorded 
+  * Cost trajectory is plotted using a log10-scale of the **median** cost of all structures across all states in each condition bucket.
+  * Solid triangle = median across all scour conditions.
+  
+```{r}
+library(stringr)
+library(bsselectR)
+state_plots <- paste0(list.files("outputs/cost3", full.names = TRUE))
+names(state_plots) <- str_replace_all(state_plots, 
+                                      c("\\.png" = "", 
+                                        "outputs/cost3/" = ""))
+
+bsselect(state_plots, type = "img", selected = "BRIDGE_IMP_COST_094.scour", 
+         live_search = TRUE, show_tick = TRUE, width=15, height=20)
+```
+
+## Condition: General {.tabset .tabset-pills .tabset-fade}
+  
+  * Original codes = 0 (bad) - 9 (excellent)
+  * Grouped codes: Poor (0-4), Fair (5-6), Good (7-9)
+  * General condition is computed as the minimum of deck, superstructure, substructure, culverts condition (items 58, 59, 60, 62). Grouped into Poor (<=4), Fair (5-6), Good (>=7)
+  * Y-axis = percentage of structures across all states in each year (stratified by respective condition)
+  * Unless otherwise stated, NA = not recorded/not applicable
+  * Dropdown menu to select states
+  
+### General {.unlisted .unnumbered}
+```{r}
+library(stringr)
+library(bsselectR)
+state_plots <- paste0(list.files("outputs/cond_gen", full.names = TRUE))
+names(state_plots) <- str_replace_all(state_plots, 
+                                      c("\\.png" = "", 
+                                        "outputs/cond_gen/" = ""))
+
+bsselect(state_plots, type = "img", selected = "Alabama", 
+         live_search = TRUE, show_tick = TRUE, width=15, height=20)
+```
+  
+  
+### DECK {.unlisted .unnumbered}
+```{r}
+library(stringr)
+library(bsselectR)
+state_plots <- paste0(list.files("outputs/cond_deck", full.names = TRUE))
+names(state_plots) <- str_replace_all(state_plots, 
+                                      c("\\.png" = "", 
+                                        "outputs/cond_deck/" = ""))
+
+bsselect(state_plots, type = "img", selected = "Alabama", 
+         live_search = TRUE, show_tick = TRUE, width=15, height=20)
+```
+
+### Superstructure {.unlisted .unnumbered}
+
+```{r}
+library(stringr)
+library(bsselectR)
+state_plots <- paste0(list.files("outputs/cond_sup", full.names = TRUE))
+names(state_plots) <- str_replace_all(state_plots, 
+                                      c("\\.png" = "", 
+                                        "outputs/cond_sup/" = ""))
+
+bsselect(state_plots, type = "img", selected = "Alabama", 
+         live_search = TRUE, show_tick = TRUE, width=15, height=20)
+```
+
+### Substructure {.unlisted .unnumbered}
+
+```{r}
+library(stringr)
+library(bsselectR)
+state_plots <- paste0(list.files("outputs/cond_sub", full.names = TRUE))
+names(state_plots) <- str_replace_all(state_plots, 
+                                      c("\\.png" = "", 
+                                        "outputs/cond_sub/" = ""))
+
+bsselect(state_plots, type = "img", selected = "Alabama", 
+         live_search = TRUE, show_tick = TRUE, width=15, height=20)
+```
+
+### Channel {.unlisted .unnumbered}
+
+```{r}
+library(stringr)
+library(bsselectR)
+state_plots <- paste0(list.files("outputs/cond_chnl", full.names = TRUE))
+names(state_plots) <- str_replace_all(state_plots, 
+                                      c("\\.png" = "", 
+                                        "outputs/cond_chnl/" = ""))
+
+bsselect(state_plots, type = "img", selected = "Alabama", 
+         live_search = TRUE, show_tick = TRUE, width=15, height=20)
+```
+
+### Culvert {.unlisted .unnumbered}
+
+```{r}
+library(stringr)
+library(bsselectR)
+state_plots <- paste0(list.files("outputs/cond_culv", full.names = TRUE))
+names(state_plots) <- str_replace_all(state_plots, 
+                                      c("\\.png" = "", 
+                                        "outputs/cond_culv/" = ""))
+
+bsselect(state_plots, type = "img", selected = "Alabama", 
+         live_search = TRUE, show_tick = TRUE, width=15, height=20)
+```
+
+## Condition: Scour
+
+* Original code: 0 (structure closed) - 9 (excellent condition), N, T, U
+* Grouped code: 0-3 (Closed/critical), 4-7,U (Stable), 8-9,T (Good). NA = not recorded/not applicable
+* Code N: no waterway (will be excluded in the following plots)
+* Code T: tidal water cannot be inspected (manual states low risk) 
+* Dropdown menu to select states
+
+```{r}
+library(stringr)
+library(bsselectR)
+state_plots <- paste0(list.files("outputs/cond_scour", full.names = TRUE))
+names(state_plots) <- str_replace_all(state_plots, 
+                                      c("\\.png" = "", 
+                                        "outputs/cond_scour/" = ""))
+
+bsselect(state_plots, type = "img", selected = "Alabama", 
+         live_search = TRUE, show_tick = TRUE, width=15, height=20)
+```
+
+## Evaluation: Detour {.tabset .tabset-pills .tabset-fade}
+
+  * Detour is evaluated in kilometers
+  * Solid triangle = median across all conditions
+  * Dropdown menu to select states
+  
+### All states {.unlisted .unnumbered}
+
+```{r}
+  a<-tmp %>%
+    group_by(STATE_CODE_001,Year) %>%  
+    # s is the median for all bridges
+    mutate(s=as.numeric(median(DETOUR_KILOS_019,na.rm=T))) %>%
+    distinct(STATE_CODE_001,Year,.keep_all = T) %>%
+    ungroup()
+  
+  p<-ggplot(a, aes(x = factor(reorder(STATE_CODE_001,-NUM_BY_STATE)),y = s)) + 
+    geom_jitter(color="grey")+
+    geom_boxplot() +
+    scale_y_continuous(breaks=pretty_breaks())+
+    labs(x = "State (ordered by the number of bridges, from highest to lowest) \n", 
+         y = paste0(label(tmp$DETOUR_KILOS_019),", median across all bridges"))+
+    theme(axis.text.x = element_text(angle=90,vjust=0))
+  p
+```
+
+### Select states: highly variable detour by year {.unlisted .unnumbered}
+
+```{r}
+  a<-tmp %>%
+    group_by(STATE_CODE_001,Year) %>%  
+    # s is the median for all bridges
+    mutate(s=as.numeric(median(DETOUR_KILOS_019,na.rm=T))) %>%
+    distinct(STATE_CODE_001,Year,.keep_all = T) %>%
+    ungroup()
+  
+  b<-a %>% group_by(STATE_CODE_001) %>% mutate(variation=IQR(s,na.rm=T)) %>%
+    distinct(STATE_CODE_001,variation) %>%
+    ungroup() %>%
+    arrange(desc(variation)) %>%
+    top_n(10)
+  
+  p<-ggplot(a %>% filter(STATE_CODE_001 %in% b$STATE_CODE_001), aes(x = factor(Year),y = s, group=STATE_CODE_001,colour=STATE_CODE_001)) + 
+    geom_line()+
+    stat_summary(
+      aes(group=1),
+      geom="point",
+      fun.y = median,
+      shape=17, size=3)+
+    scale_y_continuous(breaks=pretty_breaks())+
+    labs(x = "Year\n", y = paste0(label(tmp$DETOUR_KILOS_019),", median across all bridges"))+
+    theme(axis.text.x = element_text(angle=90,vjust=0))
+  p
+```
+
+### All states: by general condition {.unlisted .unnumbered}
+
+```{r}
+library(stringr)
+library(bsselectR)
+state_plots <- paste0(list.files("outputs/eval_detour2", full.names = TRUE))
+names(state_plots) <- str_replace_all(state_plots, 
+                                      c("\\.png" = "", 
+                                        "outputs/eval_detour2/" = ""))
+
+bsselect(state_plots, type = "img", selected = "Alabama", 
+         live_search = TRUE, show_tick = TRUE, width=15, height=20)
+```
+
+### All states: by scour condition {.unlisted .unnumbered}
+
+```{r}
+library(stringr)
+library(bsselectR)
+state_plots <- paste0(list.files("outputs/eval_detour3", full.names = TRUE))
+names(state_plots) <- str_replace_all(state_plots, 
+                                      c("\\.png" = "", 
+                                        "outputs/eval_detour3/" = ""))
+
+bsselect(state_plots, type = "img", selected = "Alabama", 
+         live_search = TRUE, show_tick = TRUE, width=15, height=20)
+```
+
+## Evaluation: Traffic 
+  
+  * Average daily traffic (ADT), recoded in millions (M)
+  * All plots by **general** or **scour** condition
+  * Dropdown menu to select states
+  
+### By general condition {.tabset .tabset-pills .tabset-fade}  
+  
+#### ADT (current) {.unlisted .unnumbered}
+  
+  * Current = at the year of inspection
+  * Plotted **total** ADT across all bridges
+
+```{r}
+library(stringr)
+library(bsselectR)
+state_plots <- paste0(list.files("outputs/eval_tfc_adt_gen", full.names = TRUE))
+names(state_plots) <- str_replace_all(state_plots, 
+                                      c("\\.png" = "", 
+                                        "outputs/eval_tfc_adt_gen/" = ""))
+
+bsselect(state_plots, type = "img", selected = "Alabama", 
+         live_search = TRUE, show_tick = TRUE, width=15, height=20)
+```
+
+#### ADT-truck (current, in %) {.unlisted .unnumbered}
+  * Current = current percentage of the average daily traffic that is truck traffic
+  * Measured at the year of inspection
+  * Plotted **median** across all bridges 
+
+```{r}
+library(stringr)
+library(bsselectR)
+state_plots <- paste0(list.files("outputs/eval_tfc_trk_gen", full.names = TRUE))
+names(state_plots) <- str_replace_all(state_plots, 
+                                      c("\\.png" = "", 
+                                        "outputs/eval_tfc_trk_gen/" = ""))
+
+bsselect(state_plots, type = "img", selected = "Alabama", 
+         live_search = TRUE, show_tick = TRUE, width=15, height=20)
+```
+
+#### ADT (future) {.unlisted .unnumbered}
+  * Estimated future average daily traffic (a basis for 20-year forecast)
+  * Plotted **total** across all bridges 
+
+```{r}
+library(stringr)
+library(bsselectR)
+state_plots <- paste0(list.files("outputs/eval_tfc_ftr_gen", full.names = TRUE))
+names(state_plots) <- str_replace_all(state_plots, 
+                                      c("\\.png" = "", 
+                                        "outputs/eval_tfc_ftr_gen/" = ""))
+
+bsselect(state_plots, type = "img", selected = "Alabama", 
+         live_search = TRUE, show_tick = TRUE, width=15, height=20)
+```
+
+### By scour condition {.tabset .tabset-pills .tabset-fade}  
+
+#### ADT (current) {.unlisted .unnumbered}
+  
+  * Current = at the year of inspection
+  * Plotted **total** ADT across all bridges
+
+```{r}
+library(stringr)
+library(bsselectR)
+state_plots <- paste0(list.files("outputs/eval_tfc_adt_scour", full.names = TRUE))
+names(state_plots) <- str_replace_all(state_plots, 
+                                      c("\\.png" = "", 
+                                        "outputs/eval_tfc_adt_scour/" = ""))
+
+bsselect(state_plots, type = "img", selected = "Alabama", 
+         live_search = TRUE, show_tick = TRUE, width=15, height=20)
+```
+
+#### ADT-truck (current, in %) {.unlisted .unnumbered}
+  * Current = current percentage of the average daily traffic that is truck traffic
+  * Measured at the year of inspection
+  * Plotted **median** across all bridges 
+
+```{r}
+library(stringr)
+library(bsselectR)
+state_plots <- paste0(list.files("outputs/eval_tfc_trk_scour", full.names = TRUE))
+names(state_plots) <- str_replace_all(state_plots, 
+                                      c("\\.png" = "", 
+                                        "outputs/eval_tfc_trk_scour/" = ""))
+
+bsselect(state_plots, type = "img", selected = "Alabama", 
+         live_search = TRUE, show_tick = TRUE, width=15, height=20)
+```
+
+#### ADT (future) {.unlisted .unnumbered}
+  * Estimated future average daily traffic (a basis for 20-year forecast)
+  * Plotted **total** across all bridges 
+
+```{r}
+library(stringr)
+library(bsselectR)
+state_plots <- paste0(list.files("outputs/eval_tfc_ftr_scour", full.names = TRUE))
+names(state_plots) <- str_replace_all(state_plots, 
+                                      c("\\.png" = "", 
+                                        "outputs/eval_tfc_ftr_scour/" = ""))
+
+bsselect(state_plots, type = "img", selected = "Alabama", 
+         live_search = TRUE, show_tick = TRUE, width=15, height=20)
+```
+
+# Relationship between outcomes
+***
+Outcomes of interest are:
+
+  1. Cost (continuous)
+  
+    * Bridge, Roadway, Total improvement cost estimates
+    
+  2. Condition (categorical)
+  
+    * General
+    * Scour
+  
+  3. Evaluation_Detour (continuous)
+  
+  4. Evaluation_Traffic (continuous)
+  
+    * ADT_current, ADT_truck, ADT_future
+    
+Correlation plots:   
+
+  * Dropdown menu to select states 
+  * Correlations are plotted for bridges with median annual values in 2010-2018
+  * States with co-linear outcomes are not shown (potential data recording error)
+  * Edge = correlation, Green = positive, Red = negative
+  * Non-signficant edges, with p-value (Bonferroni-corrected) > 0.05. are removed  
+  
+```{r}
+library(stringr)
+library(bsselectR)
+
+state_plots <- paste0(list.files("outputs/corr_ep", full.names = TRUE))
+names(state_plots) <- str_replace_all(state_plots, 
+                                      c("\\.png" = "", 
+                                        "outputs/corr_ep/" = ""))
+
+bsselect(state_plots, type = "img", selected = "Alabama", 
+         live_search = TRUE, show_tick = TRUE, width=15, height=20)
+```
+
+# Relationship between predictors
+***
+
+* Distributions are summarised in a downloadable spreadsheet.
+* Summaries for year 2018 are reported. 20 bridges are randomly selected in each state.
+* Summaries are separated by general condition, with p-values<0.05 indicating statistically significant relationship between predictor and condition.
+
+```{r}
+library(table1)
+library(DT)
+library(htmltab)
+library(arsenal)
+
+# Create table with these indices to be excluded as columns
+index<-c(2:21,24,26,28,29,32,41,46,47,49,67,68,69,70,71,76,77,78,79,80,81,82,85,87,88,89,107,115,96,147,148,
+         25,31,45,51,74,86,90,91,92,96,97,98,99,103,105,113,114,117)
+
+a<-tmp[tmp$Year==2018,-index] %>%
+  group_by(STATE_CODE_001) %>%
+  sample_n(20) %>%
+  ungroup() %>%
+  select(-STATE_CODE_001)
+
+# # randomly sample x columns
+# x<-5
+# index<-c(sample(ncol(a),x),ncol(a))
+  
+mycontrols  <- tableby.control(test=T, total=T,digits = 1, digits.pct = 1,digits.p=3,
+                               numeric.test="kwt", cat.test="chisq")
+
+datatable(data = as.data.frame(summary(
+  tableby(GEN_COND.alt~., data=a,control=mycontrols),
+  text=T)),
+          extensions = list('Buttons' = NULL, 'FixedColumns' = NULL),
+          rownames = FALSE,
+      options = list(
+        paging=TRUE,
+        ordering=FALSE,
+       dom = 'Bfrtip',
+      scrollX = TRUE,
+      pageLength = 15,
+      fixedHeader = TRUE,
+      fixedColumns = list(leftColumns = 1)))
+
+```
+  
